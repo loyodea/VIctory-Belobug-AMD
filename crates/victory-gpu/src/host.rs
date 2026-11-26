@@ -78,6 +78,17 @@ static PREWARM_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 /// waited for and its results put back.
 static FINISHED_FENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+struct DeviceRemoved;
+
+/// D3D12 returns `UINT64_MAX` and wakes fence waits when the device is removed.
+fn completed_fence_value(value: u64) -> Result<u64, DeviceRemoved> {
+    if value == u64::MAX {
+        Err(DeviceRemoved)
+    } else {
+        Ok(value)
+    }
+}
+
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) depth_bounds_supported: bool,
@@ -618,10 +629,13 @@ mod tests {
                 complete();
             }
             let mut during_prewarm = None;
-            host.drain_in_flight_locked(Some(|| {
-                during_prewarm = Some((written.get(), held_list.strong_count()));
-                complete();
-            }));
+            assert!(
+                host.drain_in_flight_locked(Some(|| {
+                    during_prewarm = Some((written.get(), held_list.strong_count()));
+                    complete();
+                }))
+                .is_ok()
+            );
             assert_eq!(during_prewarm, (!already_completed).then_some((0, 1)));
             assert_eq!(written.get(), 23);
             assert!(held_list.upgrade().is_none());
@@ -1172,9 +1186,9 @@ impl Host {
         }
     }
 
-    fn completed_fence(&self) -> u64 {
+    fn completed_fence(&self) -> Result<u64, DeviceRemoved> {
         // SAFETY: a plain fence query.
-        unsafe { self.fence.GetCompletedValue() }
+        completed_fence_value(unsafe { self.fence.GetCompletedValue() })
     }
 
     /// Finishes the unwaited submissions through `completed`, oldest first, and
@@ -1211,6 +1225,26 @@ impl Host {
         }
     }
 
+    /// Reports removal with the pending lists. The caller releases `submitted`
+    /// before diagnostics inspect the lists and other GPU state.
+    fn fail_in_flight(&self) -> ! {
+        let lists: Vec<_> = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(|pending| pending.finish.as_ref())
+            .flat_map(|finish| finish.lists.iter().cloned())
+            .collect();
+        let runs: Vec<&HostList> = lists.iter().map(|list| &**list).collect();
+        fail(format_args!(
+            "host GPU device removed while waiting for asynchronous submissions ({} pending lists){}{}",
+            runs.len(),
+            self.removal_data(&runs),
+            last_notes(&runs)
+        ));
+    }
+
     /// Whether a submission is still to be waited for and finished.
     fn has_in_flight(&self) -> bool {
         !self.in_flight.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
@@ -1221,18 +1255,26 @@ impl Host {
         if target == 0 || FINISHED_FENCE.load(Ordering::Acquire) >= target {
             return;
         }
-        let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: the fence and event are ours; guarded by `submitted`.
-        unsafe {
-            if self.fence.GetCompletedValue() < target {
+        let submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut completed = self.completed_fence();
+        if completed.as_ref().is_ok_and(|&value| value < target) {
+            // SAFETY: the fence and event are ours; guarded by `submitted`.
+            unsafe {
                 if let Err(e) = self.fence.SetEventOnCompletion(target, self.event) {
                     tracing::warn!(error = %e, "host fence wait failed");
                 } else {
                     WaitForSingleObject(self.event, INFINITE);
                 }
             }
+            completed = self.completed_fence();
         }
-        self.reap_completed(self.completed_fence());
+        match completed {
+            Ok(completed) => self.reap_completed(completed),
+            Err(DeviceRemoved) => {
+                drop(submitted);
+                self.fail_in_flight();
+            }
+        }
     }
 
     /// Waits for all in-flight asynchronous submissions to complete.
@@ -1251,7 +1293,7 @@ impl Host {
 
     /// Finishes the previous async submission while `submitted` is held.
     /// Runs optional preparation only if there is still GPU work to overlap.
-    fn drain_in_flight_locked(&self, prewarm: Option<impl FnOnce()>) {
+    fn drain_in_flight_locked(&self, prewarm: Option<impl FnOnce()>) -> Result<(), DeviceRemoved> {
         let target = self
             .in_flight
             .lock()
@@ -1260,12 +1302,12 @@ impl Host {
             .map(|f| f.fence)
             .unwrap_or(0);
         if target == 0 {
-            return;
+            return Ok(());
         }
-        let mut completed = self.completed_fence();
+        let mut completed = self.completed_fence()?;
         if completed < target && let Some(prewarm) = prewarm {
             prewarm();
-            completed = self.completed_fence();
+            completed = self.completed_fence()?;
         }
         if completed < target {
             let waited = std::time::Instant::now();
@@ -1279,9 +1321,10 @@ impl Host {
                 }
             }
             SUBMISSION_US[1].fetch_add(waited.elapsed().as_micros() as u64, Ordering::Relaxed);
-            completed = self.completed_fence();
+            completed = self.completed_fence()?;
         }
         self.reap_completed(completed);
+        Ok(())
     }
 
     /// Runs closed lists; waits synchronously when CPU copy-back, readbacks, or
@@ -1341,7 +1384,13 @@ impl Host {
         // buffers in `prepare`. During the gap between submissions, the GPU
         // ran in parallel with the title's CPU command-list recording, and
         // runs on while this submission's buffer copies are refreshed.
-        self.drain_in_flight_locked(keep.is_some().then_some(|| self.prewarm(runs)));
+        if self
+            .drain_in_flight_locked(keep.is_some().then_some(|| self.prewarm(runs)))
+            .is_err()
+        {
+            drop(submitted);
+            self.fail_in_flight();
+        }
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -4405,6 +4454,15 @@ fn pump() {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn removed_device_fence_is_not_a_completion() {
+    assert!(matches!(completed_fence_value(u64::MAX), Err(DeviceRemoved)));
+    for value in [0, 1, u64::MAX - 1] {
+        assert_eq!(completed_fence_value(value).ok(), Some(value));
     }
 }
 
