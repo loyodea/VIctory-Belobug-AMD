@@ -40,8 +40,8 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
-    /// The copy's bytes before the submission ran, from an offset on,
-    /// covering the ranges its shaders write: what the GPU wrote differs.
+    /// The copy's pre-submission bytes in declared write ranges, advanced
+    /// as GPU writes are merged back into title memory.
     before: Mutex<Before>,
     /// The buffer is the title's memory itself ([`direct`]): nothing is
     /// copied either way.
@@ -564,15 +564,15 @@ impl Shadow {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = &*snapshot
+        if let Some((taken, before)) = snapshot.as_mut()
             && *taken <= from
-            && to <= taken + before.len()
+            && to <= *taken + before.len()
             && from < to
         {
-            unchanged.begin(start + taken, start + taken + before.len());
-            let before = &before[from - taken..to - taken];
-            // By 64 KiB piece: the copy compared with its bytes before the
-            // submission, title memory read only where the GPU wrote.
+            unchanged.begin(start + *taken, start + *taken + before.len());
+            let before = &mut before[from - *taken..to - *taken];
+            // Compare in 64 KiB pieces, reading title memory only where
+            // the GPU wrote bytes that still need merging.
             // An unchanged page is never modified by copy-back, so later
             // overlapping ranges can skip it for the rest of the submission.
             let mode = self.watched.load(Ordering::Relaxed);
@@ -584,7 +584,7 @@ impl Shadow {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
+                let old = &mut before[at - from..at - from + n];
                 if unchanged.differs(start + at, host, old) {
                     let buf = title.get_or_insert_with(|| {
                         let mut v = pooled(PAGE);
@@ -593,8 +593,8 @@ impl Shadow {
                     });
                     let title_slice = &mut buf[..n];
                     if crate::host::read_into((start + at) as *const u8, title_slice) {
-                        // Title memory with the GPU's bytes put in; the copy
-                        // takes the title's bytes in turn.
+                        // Advance the snapshot as we merge so overlapping
+                        // ranges only see GPU writes still to be copied back.
                         if let Some((dirty_start, dirty_end)) =
                             merge_gpu_writes(title_slice, host, old)
                         {
@@ -2147,7 +2147,7 @@ impl Shadow {
                 if !crate::host::read_into(at as *const u8, &mut buf[..n]) {
                     continue;
                 }
-                if let Some((dirty_start, dirty_end)) = merge_gpu_writes_mut(&mut buf[..n], host, old) {
+                if let Some((dirty_start, dirty_end)) = merge_gpu_writes(&mut buf[..n], host, old) {
                     let dirty_len = dirty_end - dirty_start;
                     crate::watch::writing(at + dirty_start, dirty_len);
                     crate::host::write_mapped(
@@ -2172,47 +2172,10 @@ impl Shadow {
     }
 }
 
-/// Merges bytes the GPU changed (`host != old`) into `title`, syncs `host` to
-/// `title`, and returns the tight `[first, last)` byte span where `title` was
-/// modified (or `None` if nothing changed). Scans 8 bytes at a time so
-/// unchanged 64-bit words skip per-byte branching.
-fn merge_gpu_writes(title: &mut [u8], host: &mut [u8], old: &[u8]) -> Option<(usize, usize)> {
-    let n = title.len().min(host.len()).min(old.len());
-    let mut first = usize::MAX;
-    let mut last = 0usize;
-    let mut i = 0;
-    while i + 8 <= n {
-        let hw = u64::from_ne_bytes(host[i..i + 8].try_into().unwrap());
-        let ow = u64::from_ne_bytes(old[i..i + 8].try_into().unwrap());
-        if hw == ow {
-            host[i..i + 8].copy_from_slice(&title[i..i + 8]);
-        } else {
-            for k in i..i + 8 {
-                let h = host[k];
-                if h != old[k] && title[k] != h {
-                    title[k] = h;
-                    first = first.min(k);
-                    last = k + 1;
-                }
-                host[k] = title[k];
-            }
-        }
-        i += 8;
-    }
-    for k in i..n {
-        let h = host[k];
-        if h != old[k] && title[k] != h {
-            title[k] = h;
-            first = first.min(k);
-            last = k + 1;
-        }
-        host[k] = title[k];
-    }
-    (first < last).then_some((first, last))
-}
-
-/// Same as [`merge_gpu_writes`], also updating `old` to match `title`.
-fn merge_gpu_writes_mut(
+/// Merges bytes the GPU changed (`host != old`) into `title` and syncs
+/// `host` and `old` to `title`. Returns the tight `[first, last)` byte span
+/// where `title` was modified, or `None` if nothing changed.
+fn merge_gpu_writes(
     title: &mut [u8],
     host: &mut [u8],
     old: &mut [u8],
@@ -2577,6 +2540,57 @@ pub(crate) fn near(va: u64) -> String {
 mod tests {
     use super::*;
     use std::ops::Range;
+
+    fn check_copied_buffer_overlap(host: &crate::host::Host) {
+        let mut title = [0u8; 64];
+        let start = title.as_mut_ptr() as usize;
+        let (buffer, data) = host.shared_buffer(title.len() as u64).unwrap();
+        // SAFETY: the newly mapped buffer is live.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let shadow = Shadow::new(buffer, data, gpu, start as u64, title.len() as u64, None);
+        shadow.watched.store(NOT_WATCHED, Ordering::Relaxed);
+        shadow.update(start, title.len());
+        shadow.writing(start, 24);
+        shadow.writing(start + 12, 20);
+
+        let (upload, patch) = host.upload_buffer(4).unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: the patch and both destination regions are in live buffers.
+        unsafe {
+            patch.write_bytes(0xA5, 4);
+            list.list.CopyBufferRegion(&shadow.buffer, 8, &upload, 0, 4);
+            list.list.CopyBufferRegion(&shadow.buffer, 24, &upload, 0, 4);
+        }
+        list.close();
+        host.execute(&[&list]);
+
+        title[16] = 0x11;
+        assert_eq!(shadow.copy_back(start, 24), 4);
+        assert_eq!(title[8..12], [0xA5; 4]);
+        assert_eq!(title[16], 0x11);
+
+        // A CPU write between the two merges must survive the overlapping
+        // copy-back, while the GPU bytes exclusive to the second range arrive.
+        title[16] = 0x22;
+        let written = shadow.copy_back(start + 12, 20);
+        assert_eq!(title[24..28], [0xA5; 4]);
+        assert_eq!(title[16], 0x22, "second copy-back replayed an older CPU write");
+        assert_eq!(written, 4);
+    }
+
+    #[test]
+    fn copied_buffer_overlap_preserves_new_cpu_write() {
+        if let Some(host) = host() {
+            check_copied_buffer_overlap(host);
+        }
+    }
+
+    #[test]
+    fn warp_copied_buffer_overlap_preserves_new_cpu_write() {
+        if let Some(host) = crate::host::Host::new_warp() {
+            check_copied_buffer_overlap(&host);
+        }
+    }
 
     #[test]
     fn partial_match_leaves_unchecked_bytes_visible() {
