@@ -253,6 +253,35 @@ fn f64_arithmetic_keeps_overlapping_source_pairs_distinct() {
 }
 
 #[test]
+fn v_fma_f64_rounds_once() {
+    let delta = 1.0 / f64::from(1 << 27);
+    // The first product is exactly 1 - 2^-54, which rounds to 1 before a separate add.
+    let cases = [
+        (1.0 + delta, 1.0 - delta),
+        (3.0, 1.0 + f64::EPSILON),
+        (-2.0, 0.75),
+    ]
+    .map(|(a, b)| {
+        let (a, b) = (a.to_bits(), b.to_bits());
+        [a as u32, (a >> 32) as u32, b as u32, (b >> 32) as u32]
+    });
+    for word in 0..2 {
+        // v[5:6] is -1.0. The FMA uses disjoint register pairs.
+        let mut body = vec![vop1(0x001, 5, 0x80), vop1(0x001, 6, 0xff), 0xBFF0_0000];
+        body.extend_from_slice(&vop3(0x14C, 7, vgpr(1), vgpr(3), vgpr(5)));
+        body.push(vop1(0x001, 0, vgpr(7 + word)));
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &cases, |backend, case, [a_lo, a_hi, b_lo, b_hi], actual| {
+            let a = f64::from_bits(u64::from(a_lo) | (u64::from(a_hi) << 32));
+            let b = f64::from_bits(u64::from(b_lo) | (u64::from(b_hi) << 32));
+            let expected = (a.mul_add(b, -1.0).to_bits() >> (32 * word)) as u32;
+            assert_eq!(actual, expected, "{backend}, case {case}, word {word}");
+            eprintln!("{backend}: f64 FMA case {case}, word {word} matches");
+        });
+    }
+}
+
+#[test]
 fn data_only_structured_srv_reads_its_bound_record_count() {
     // The second heap slot contains an SRV. Its only use is a read of dword 2.
     let mut load = s_load_dwordx4(12, 4);

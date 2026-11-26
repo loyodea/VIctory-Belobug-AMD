@@ -8317,7 +8317,7 @@ impl<'a> Lower<'a> {
                         self.s.flags |= flags::DOUBLE_EXT;
                         let f64t = self.s.m.double();
                         self.s
-                            .op(c, "fma.f64", Attr::ReadNone, f64t, 47, &[a, b, d])
+                            .op(c, "tertiary.f64", Attr::ReadNone, f64t, 47, &[a, b, d])
                     }
                 };
                 self.write_f64(inst, r, guard)
