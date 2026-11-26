@@ -468,6 +468,8 @@ fn half_shift(width: u32) -> u32 {
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
+    /// The first DXIL block, where stack allocations must be made.
+    entry: usize,
     /// SGPR spills to VGPR lanes and their reloads that nothing reads any
     /// more (see [`crate::sgpr_spill`]): not lowered.
     dead: HashSet<Site>,
@@ -1276,6 +1278,7 @@ impl<'a> Lower<'a> {
             }
         }
         Lower {
+            entry: s.entry,
             s,
             x,
             bad,
@@ -1470,7 +1473,7 @@ impl<'a> Lower<'a> {
             None => {
                 let dwords = scratch_bytes(self.x.p).div_ceil(4);
                 let ty = self.s.m.array(dwords, self.s.t.i32);
-                let a = (self.s.m.alloca(self.s.entry, ty), dwords);
+                let a = (self.s.m.alloca(self.entry, ty), dwords);
                 self.scratch = Some(a);
                 a
             }
@@ -1978,6 +1981,7 @@ impl<'a> Lower<'a> {
                 },
             ));
         }
+        self.console_thread_prologue();
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -4240,10 +4244,8 @@ impl<'a> Lower<'a> {
     }
 
     /// Component `c` of the thread id in the group. With console lanes, the
-    /// thread is relabelled so that its host lane is its console lane: the
-    /// flat id is the wave's first lane's, rounded down to the wave size,
-    /// plus the lane index. (A bijection while each host wave holds a
-    /// wave-aligned run of flat ids, as the console's waves do.)
+    /// thread is relabelled so that its host lane is its console lane. The
+    /// original group dimensions determine its coordinates.
     fn thread_id(&mut self, c: u8) -> Val {
         if !self.console_lanes {
             return self.compute_id("threadIdInGroup.i32", 95, c);
@@ -12608,40 +12610,162 @@ impl<'a> Lower<'a> {
         self.s.m.extract(at, r, 0)
     }
 
+    /// Give each full host wave a distinct, aligned block of console IDs.
+    /// A dense partial wave takes the last block. Lanes keep their native
+    /// indices, so ballots and indexed reads still see the console lanes.
+    fn console_thread_prologue(&mut self) {
+        let (Some([x, y, z]), Some(wave)) = (self.s.threads, self.s.wave_size) else {
+            return;
+        };
+        let threads = x * y * z;
+        if !self.console_lanes
+            || self.split
+            || y == 1 && z == 1
+            || threads <= wave
+            // Partial thread dispatches still predicate on the host's IDs.
+            || self.x.res.addresses
+            // Leave one extra dword within D3D12's 32 KiB groupshared limit.
+            || self.s.lds_dwords >= 32 * 1024 / 4
+            || !self
+                .x
+                .io
+                .inputs
+                .iter()
+                .any(|(_, input)| matches!(input, Input::ThreadIdInGroup(_)))
+        {
+            return;
+        }
+
+        let e = self.s.entry;
+        let init = self.s.m.new_block();
+        let ready = self.s.m.new_block();
+        let take = self.s.m.new_block();
+        let done = self.s.m.new_block();
+        let (i32t, i1, void) = (self.s.t.i32, self.s.t.i1, self.s.t.void);
+        let zero = self.s.m.i32(0);
+        let raw = self.group_index(e);
+        let counter = self.s.m.global("consoleWaveTickets", i32t, 3);
+        let mode = self.s.m.i32(1 | 8); // Group sync and groupshared fence.
+        let first_thread = self.s.m.cmp(e, pred::EQ, raw, zero);
+        self.s
+            .m
+            .terminate(e, Term::CondBr(first_thread, init, ready));
+        self.s.m.store(init, counter, zero);
+        self.s.m.terminate(init, Term::Br(ready));
+        self.s
+            .op(ready, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+
+        // Count full waves plus, if needed, one partial wave occupying its
+        // low lanes. The group size and full-wave count imply the number of
+        // partial waves. Charge a bad wave more than the maximum 32 full waves.
+        let lane = self.host_lane_index(ready);
+        let yes = self.s.m.bool(true);
+        let count = self
+            .s
+            .op(ready, "waveAllOp", Attr::NoUnwind, i32t, 135, &[yes]);
+        let wave_size = self.s.m.i32(wave);
+        let full = self.s.m.cmp(ready, pred::EQ, count, wave_size);
+        let invalid = self.s.m.i32(64);
+        let tail = threads % wave;
+        let other = if tail == 0 {
+            invalid
+        } else {
+            let size = self.s.m.i32(tail);
+            let low = self.s.m.cmp(ready, pred::IULT, lane, size);
+            let dense = self
+                .s
+                .op(ready, "waveAllTrue", Attr::NoUnwind, i1, 114, &[low]);
+            let tail_size = self.s.m.cmp(ready, pred::EQ, count, size);
+            let tail_wave = self.s.m.bin(ready, Bin::And, dense, tail_size);
+            self.s.m.select(ready, tail_wave, zero, invalid)
+        };
+        let one = self.s.m.i32(1);
+        let increment = self.s.m.select(ready, full, one, other);
+        let leader = self
+            .s
+            .op(ready, "waveIsFirstLane", Attr::NoUnwind, i1, 110, &[]);
+        self.s.m.terminate(ready, Term::CondBr(leader, take, done));
+        let ticket = self.s.m.atomic(take, Rmw::Add, counter, increment);
+        self.s.m.terminate(take, Term::Br(done));
+        let old = self.s.m.phi(done, i32t);
+        self.s.m.set_phi(old, vec![(zero, ready), (ticket, take)]);
+        let ticket = self.s.op(
+            done,
+            "waveReadLaneFirst.i32",
+            Attr::NoUnwind,
+            i32t,
+            118,
+            &[old],
+        );
+
+        self.s
+            .op(done, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        let total = self.s.m.load(done, counter);
+        let expected = self.s.m.i32(threads / wave);
+        let valid = self.s.m.cmp(done, pred::EQ, total, expected);
+        let base = self.s.m.bin(done, Bin::Mul, ticket, wave_size);
+        let base = if tail == 0 {
+            base
+        } else {
+            let tail_base = self.s.m.i32(threads - tail);
+            self.s.m.select(done, full, base, tail_base)
+        };
+        // If the host splits the group into irregular partial waves, a
+        // packed ID would make the logical and hardware lane indices differ.
+        let fallback = self.rounded_wave_base(done, raw, wave);
+        let base = self.s.m.select(done, valid, base, fallback);
+        self.console_flat = Some(self.s.m.bin(done, Bin::Add, base, lane));
+        self.s.flags |= flags::WAVE_OPS;
+        // A console branch to the entry block must skip the group barriers.
+        self.s.entry = self.s.m.new_block();
+        self.s.m.terminate(done, Term::Br(self.s.entry));
+    }
+
+    fn group_index(&mut self, at: usize) -> V {
+        self.s.op(
+            at,
+            "flattenedThreadIdInGroup.i32",
+            Attr::ReadNone,
+            self.s.t.i32,
+            96,
+            &[],
+        )
+    }
+
+    fn host_lane_index(&mut self, at: usize) -> V {
+        self.s.op(
+            at,
+            "waveGetLaneIndex",
+            Attr::ReadOnly,
+            self.s.t.i32,
+            111,
+            &[],
+        )
+    }
+
+    fn rounded_wave_base(&mut self, at: usize, flat: V, wave: u32) -> V {
+        let first = self.s.op(
+            at,
+            "waveReadLaneFirst.i32",
+            Attr::NoUnwind,
+            self.s.t.i32,
+            118,
+            &[flat],
+        );
+        let mask = self.s.m.i32(!(wave - 1));
+        self.s.m.bin(at, Bin::And, first, mask)
+    }
+
     /// The console thread's flat id in the group (see [`Self::thread_id`]).
     fn console_flat(&mut self) -> V {
         if let Some(f) = self.console_flat {
             return f;
         }
         let e = self.s.entry;
-        let i32t = self.s.t.i32;
-        let flat = self.s.op(
-            e,
-            "flattenedThreadIdInGroup.i32",
-            Attr::ReadNone,
-            i32t,
-            96,
-            &[],
-        );
-        let first = self.s.op(
-            e,
-            "waveReadLaneFirst.i32",
-            Attr::NoUnwind,
-            i32t,
-            118,
-            &[flat],
-        );
         let wave = self.s.wave_size.expect("set with console lanes");
-        let mask = self.s.m.i32(!(wave - 1));
-        let base = self.s.m.bin(e, Bin::And, first, mask);
-        let lane = self.s.op(
-            e,
-            "waveGetLaneIndex",
-            Attr::ReadOnly,
-            self.s.t.i32,
-            111,
-            &[],
-        );
+        let flat = self.group_index(e);
+        let base = self.rounded_wave_base(e, flat, wave);
+        let lane = self.host_lane_index(e);
         let f = self.s.m.bin(e, Bin::Add, base, lane);
         self.s.flags |= flags::WAVE_OPS;
         self.console_flat = Some(f);

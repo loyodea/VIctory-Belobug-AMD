@@ -394,3 +394,93 @@ fn loops_with_an_exit_mask_grown_from_zero() {
     ];
     console_flow_case("exit-mask loop reading lane 40", &body, 64, |_| 40 + 64);
 }
+
+/// Each logical dword gets one atomic update, even if the driver's waves
+/// group nonconsecutive physical thread IDs. Read lane zero's flattened ID
+/// to check that every native wave has one aligned block of console IDs.
+fn native_lane_program(threads: [u32; 3], wave: u32, lds: bool) -> crate::NativeProgram {
+    let [x, y, _] = threads;
+    let n = threads.iter().product::<u32>();
+    let mut words = vec![
+        0xBE82_0300, // s_mov_b32 s2, s0
+        0xBE83_0380, // s_mov_b32 s3, 0
+        0xF408_0101,
+        0xFA00_0000, // s_load_dwordx4 s[4:7], s[2:3], null
+        0x9308_FF01,
+        n * 4,       // s_mul_i32 s8, s1, n * 4
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xD569_0005,
+        0x0001_FF01,
+        x, // v_mul_lo_u32 v5, v1, X
+        0xD569_0006,
+        0x0001_FF02,
+        x * y,       // v_mul_lo_u32 v6, v2, XY
+        0x4A08_0B00, // v_add_nc_u32 v4, v0, v5
+        0x4A08_0D04, // v_add_nc_u32 v4, v4, v6
+        0xD760_0009,
+        0x0001_0104, // v_readlane_b32 s9, v4, 0
+        0x7E04_0209, // v_mov_b32 v2, s9
+        0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+        0x3406_0882, // v_lshlrev_b32 v3, 2, v4
+    ];
+    if lds {
+        // Exchange with the lane at the same index in the other wave.
+        words.extend_from_slice(&[
+            0xD834_0000,
+            0x0000_0203, // ds_write_b32 v3, v2
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xBF8A_0000, // s_barrier
+            0x3A0E_06FF,
+            wave * 4, // v_xor_b32 v7, wave * 4, v3
+            0xD8D8_0000,
+            0x0200_0007, // ds_read_b32 v2, v7
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        ]);
+    }
+    words.extend_from_slice(&[
+        0x4A06_0608, // v_add_nc_u32 v3, s8, v3
+        0xE0C8_1000,
+        0x8001_0203, // buffer_atomic_add v2, v3, s[4:7], 0 offen
+        S_ENDPGM,
+    ]);
+    let mut p = compute(&words, wave == 64);
+    p.layout = program(&[], 64).layout;
+    p.io = StageIo::Cs(crate::native::ComputeIo {
+        rsrc2: 1 << 1 | 1 << 7 | 2 << 11 | (u32::from(lds) * (n * 4).div_ceil(512) << 15),
+        threads,
+    });
+    p
+}
+
+#[test]
+fn multidimensional_groups_assign_distinct_native_wave_blocks() {
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 device; skipped");
+        return;
+    };
+    for wave in [32, 64] {
+        if !host.target().runs(wave) {
+            continue;
+        }
+        for (threads, lds) in [
+            ([wave, 2, 1], false),
+            ([32, 2, 2], false),
+            ([10, 10, 1], false),
+            ([wave, 2, 1], true),
+        ] {
+            let p = native_lane_program(threads, wave, lds);
+            let n: u32 = threads.iter().product();
+            let groups = 3;
+            let out = run(&host, &p, groups)
+                .unwrap_or_else(|e| panic!("wave{wave}, {threads:?}, LDS {lds}: {e}"));
+            let want: Vec<u32> = (0..groups)
+                .flat_map(|_| (0..n).map(|t| 1 + ((if lds { t ^ wave } else { t }) & !(wave - 1))))
+                .collect();
+            assert_eq!(out.len(), want.len());
+            for (i, (got, want)) in out.into_iter().zip(want).enumerate() {
+                assert_eq!(got, want, "wave{wave}, {threads:?}, LDS {lds}, dword {i}");
+            }
+            eprintln!("wave{wave}, {threads:?}, LDS {lds}: {n} exact IDs x {groups} groups");
+        }
+    }
+}
