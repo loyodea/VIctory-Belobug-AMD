@@ -114,6 +114,9 @@ AMD:
   their pipeline, not the run.
 - Buffer element counts come from the host's own table, not a size query the
   driver's compiler crashes on.
+- Double-precision source pairs that share a register stay distinct in the
+  AMD compiler. Synthetic add/multiply tests pass on an RX 9060 XT and WARP;
+  no effect on a title's rendering or speed has been measured.
 
 Lifetimes: a list keeps the copies of title memory whose addresses it gives
 as root views, and objects the title let go of are kept eight seconds at

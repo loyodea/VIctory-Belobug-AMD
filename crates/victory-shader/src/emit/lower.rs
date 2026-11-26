@@ -8374,6 +8374,10 @@ impl<'a> Lower<'a> {
     fn src_f64(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
         let bits = self.fp_bits(inst, k, 64)?;
         let (lo, hi) = self.split64(bits);
+        // AMD can merge overlapping makeDouble source pairs (#82). Reversing the low
+        // dword twice preserves every bit while keeping the pairs distinct in its compiler.
+        let lo = self.s.op(self.cur, "unary.i32", Attr::ReadNone, self.s.t.i32, 30, &[lo]);
+        let lo = self.s.op(self.cur, "unary.i32", Attr::ReadNone, self.s.t.i32, 30, &[lo]);
         self.s.flags |= flags::DOUBLES;
         let f64t = self.s.m.double();
         Ok(self

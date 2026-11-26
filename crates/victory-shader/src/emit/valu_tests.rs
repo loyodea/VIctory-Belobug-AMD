@@ -206,6 +206,53 @@ fn run_with_views(
 }
 
 #[test]
+fn f64_arithmetic_keeps_overlapping_source_pairs_distinct() {
+    let cases = [
+        [0, 0x3FF8_0000, 0x3FF0_0000, 0x4000_0000],
+        [0, 0x3FF0_0000, 0x4000_0000, 0x3FF8_0000],
+        [0x1234_5678, 0x4014_0000, 0xC000_0000, 0x3FE0_0000],
+        [0x8765_4321, 0xBFF8_0000, 0x3FE0_0000, 0x4008_0000],
+        [0, 0x8000_0000, 0x3FF0_0000, 0x3FF0_0000],
+        [0, 0, 0x3FF0_0000, 0x3FF0_0000],
+        [0; 4],
+    ];
+    let mut checked = std::collections::BTreeMap::new();
+    let mut mismatches = Vec::new();
+    for (name, opcode) in [("v_add_f64", 0x164), ("v_mul_f64", 0x165)] {
+        for (first, second) in [(1, 1), (1, 2), (2, 1), (1, 3)] {
+            for (abs, neg) in [(0, 0), (1, 0), (1, 3)] {
+                for word in 0..2 {
+                    let mut inst = vop3(opcode, 6, vgpr(first), vgpr(second), 0);
+                    inst[0] |= abs << 8;
+                    inst[1] |= neg << 29;
+                    let mut body = inst.to_vec();
+                    body.push(vop1(0x001, 0, vgpr(6 + word)));
+                    let shader = build_valu_cs(&body);
+                    run_cases(&shader, &cases, |backend, case, inputs, actual| {
+                        let pair = |i: usize| {
+                            f64::from_bits(u64::from(inputs[i]) | (u64::from(inputs[i + 1]) << 32))
+                        };
+                        let (mut a, mut b) = (pair(usize::from(first - 1)), pair(usize::from(second - 1)));
+                        if abs & 1 != 0 { a = a.abs(); }
+                        if neg & 1 != 0 { a = -a; }
+                        if neg & 2 != 0 { b = -b; }
+                        let expected = if name == "v_add_f64" { a + b } else { a * b };
+                        let expected = (expected.to_bits() >> (32 * word)) as u32;
+                        *checked.entry(backend.to_string()).or_insert(0) += 1;
+                        if actual != expected {
+                            mismatches.push(format!(
+                                "{backend} {name} case {case}, src {first}/{second}, abs {abs}, neg {neg}, word {word}: {actual:#010x} != {expected:#010x}"));
+                        }
+                    });
+                }
+            }
+        }
+    }
+    eprintln!("f64 arithmetic checks: {checked:?}");
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+#[test]
 fn data_only_structured_srv_reads_its_bound_record_count() {
     // The second heap slot contains an SRV. Its only use is a read of dword 2.
     let mut load = s_load_dwordx4(12, 4);
