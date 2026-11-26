@@ -39,24 +39,44 @@ fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
     CLOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Default runtime frame-rate cap (240 Hz OLED target); `VICTORY_FPS=0`
-/// uncaps completely, `VICTORY_FPS=<n>` caps at `<n>`. Tests keep the title's
-/// own interval.
 const DEFAULT_FPS: u32 = 240;
 
-fn fps_override() -> Option<u32> {
+/// By default, the title sets the cadence up to `DEFAULT_FPS`.
+/// `VICTORY_FPS=<n>` replaces it, and `VICTORY_FPS=0` disables pacing.
+#[derive(Clone, Copy)]
+enum Pacing {
+    Default,
+    Fixed(u32),
+    Uncapped,
+}
+
+fn pacing() -> Pacing {
     if cfg!(test) {
-        return None;
+        return Pacing::Default;
     }
-    static CAP: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| match std::env::var("VICTORY_FPS") {
-        Ok(v) => v.trim().parse::<u32>().ok().filter(|&n| n > 0),
-        Err(_) => Some(DEFAULT_FPS),
+    static PACING: std::sync::OnceLock<Pacing> = std::sync::OnceLock::new();
+    *PACING.get_or_init(|| match std::env::var("VICTORY_FPS") {
+        Ok(v) => match v.trim().parse::<u32>() {
+            Ok(n) if n > 0 => Pacing::Fixed(n),
+            _ => Pacing::Uncapped,
+        },
+        Err(_) => Pacing::Default,
     })
 }
 
-fn uncapped() -> bool {
-    !cfg!(test) && fps_override().is_none()
+fn frame_interval(length: u32, pacing: Pacing) -> Duration {
+    let requested = match length {
+        0 => SIXTIETH,
+        us => Duration::from_micros(u64::from(us)),
+    };
+    match pacing {
+        Pacing::Default => {
+            let minimum = Duration::from_nanos(1_000_000_000_u64.div_ceil(u64::from(DEFAULT_FPS)));
+            requested.max(minimum)
+        }
+        Pacing::Fixed(fps) => Duration::from_nanos(1_000_000_000 / u64::from(fps)),
+        Pacing::Uncapped => requested,
+    }
 }
 
 /// Device method: a frame every `length` microseconds. The period is how
@@ -69,15 +89,13 @@ pub(crate) extern "system" fn set_interval(
     _period: u32,
     _flags: u32,
 ) -> HRESULT {
-    let interval = if let Some(fps) = fps_override() {
-        Duration::from_nanos(1_000_000_000 / u64::from(fps))
-    } else {
-        match length {
-            0 => SIXTIETH,
-            us => Duration::from_micros(u64::from(us)),
-        }
-    };
-    tracing::info!(?interval, uncapped = uncapped(), "frame interval");
+    let pacing = pacing();
+    let interval = frame_interval(length, pacing);
+    tracing::info!(
+        ?interval,
+        uncapped = matches!(pacing, Pacing::Uncapped),
+        "frame interval"
+    );
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()
@@ -153,7 +171,7 @@ pub(crate) extern "system" fn wait(
     token: *mut u64,
 ) -> HRESULT {
     let origin = kind == ORIGIN;
-    let (wait, hr) = if uncapped() {
+    let (wait, hr) = if matches!(pacing(), Pacing::Uncapped) {
         last(kind).fetch_add(1, Ordering::Relaxed);
         (Duration::ZERO, S_OK)
     } else {
@@ -208,6 +226,24 @@ pub(crate) extern "system" fn statistics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_cap_preserves_the_titles_interval() {
+        assert_eq!(
+            frame_interval(33_333, Pacing::Default),
+            Duration::from_micros(33_333)
+        );
+        assert_eq!(frame_interval(16_667, Pacing::Default), SIXTIETH);
+        assert_eq!(frame_interval(0, Pacing::Default), SIXTIETH);
+        assert_eq!(
+            frame_interval(2_000, Pacing::Default),
+            Duration::from_nanos(4_166_667)
+        );
+        assert_eq!(
+            frame_interval(33_333, Pacing::Fixed(120)),
+            Duration::from_nanos(8_333_333)
+        );
+    }
 
     #[test]
     fn waits_end_on_ticks_and_count_frames() {
