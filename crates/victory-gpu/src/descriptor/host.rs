@@ -1498,26 +1498,37 @@ impl HostHeap {
         }
         let _done = Done(&self.recording);
         let started = std::time::Instant::now();
-        // Asked before taking the heap's lock: the placed textures' lock is
-        // taken first where both are held.
-        let live = evictions.then(crate::resource::placed_live);
+        let live;
         let (todo, due) = {
             // The submission may hold the heap's lock for a while: the work
             // waits for a later draw rather than this one waiting.
-            let mut b = match self.bindless.try_lock() {
-                Ok(b) => b,
-                Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock) => return,
+            let try_bindless = || match self.bindless.try_lock() {
+                Ok(b) => Some(b),
+                Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            };
+            let Some(mut b) = try_bindless() else { return };
+            live = if evictions {
+                // A busy heap can defer the scan. Release the lock before
+                // taking the snapshot to preserve the placed texture lock order.
+                drop(b);
+                let live = crate::resource::placed_live();
+                let Some(locked) = try_bindless() else { return };
+                b = locked;
+                Some(live)
+            } else {
+                None
             };
             let b = &mut *b;
             if let Some(live) = &live {
                 b.uploaded.retain(|t, _| live.contains(t));
-                for (&slot, &(_, t)) in &b.recorded {
-                    if !live.contains(&t) {
+                b.recorded.retain(|&slot, (_, t)| {
+                    let alive = live.contains(t);
+                    if !alive {
                         b.record_pending.insert(slot);
                     }
-                }
-                b.recorded.retain(|_, (_, t)| live.contains(t));
+                    alive
+                });
                 self.record_looked[0].store(epoch, Ordering::Release);
                 self.record_looked[1].store(frame + 1, Ordering::Release);
             }
