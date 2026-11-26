@@ -445,8 +445,9 @@ fn native_lane_program(threads: [u32; 3], wave: u32, lds: bool) -> crate::Native
     ]);
     let mut p = compute(&words, wave == 64);
     p.layout = program(&[], 64).layout;
+    let lds_units = u32::from(lds) * (n * 4).div_ceil(512);
     p.io = StageIo::Cs(crate::native::ComputeIo {
-        rsrc2: 1 << 1 | 1 << 7 | 2 << 11 | (u32::from(lds) * (n * 4).div_ceil(512) << 15),
+        rsrc2: 1 << 1 | 1 << 7 | 2 << 11 | lds_units << 15,
         threads,
     });
     p
