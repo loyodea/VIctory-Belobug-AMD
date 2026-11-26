@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
+use windows_sys::Win32::Foundation::ERROR_INVALID_USER_BUFFER;
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
@@ -921,6 +922,8 @@ fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
 /// Nanoseconds workers spent reading files, for the debug summary.
 static READING: AtomicU64 = AtomicU64::new(0);
 
+const RAW_READ_STAGING_LIMIT: usize = 1024 * 1024;
+
 /// Fills `out` (the source size) from the request's file or memory.
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
@@ -933,19 +936,70 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         .state
         .file;
     let started = std::time::Instant::now();
-    let mut done = 0;
-    let result = loop {
-        if done == out.len() {
-            break Ok(());
-        }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
-            Ok(0) => break Err(END_OF_FILE),
-            Ok(n) => done += n,
-            Err(error) => break Err(from_win32(&error)),
-        }
-    };
+    let result = read_file_into(out, request.offset, request.options == 0, |buf, at| {
+        file.seek_read(buf, at)
+    });
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     result
+}
+
+fn read_file_into(
+    out: &mut [u8],
+    offset: u64,
+    allow_staging: bool,
+    mut read: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+) -> Result<(), HRESULT> {
+    let mut done = 0;
+    while done < out.len() {
+        let at = offset.checked_add(done as u64).ok_or(E_INVALIDARG)?;
+        match read(&mut out[done..], at) {
+            Ok(0) => return Err(END_OF_FILE),
+            Ok(n) => done += n,
+            Err(error)
+                if allow_staging
+                    && error.raw_os_error() == Some(ERROR_INVALID_USER_BUFFER as i32) =>
+            {
+                tracing::debug!(
+                    offset = at,
+                    "dstorage: staging raw read after invalid user buffer"
+                );
+                return read_file_staged(&mut out[done..], at, read);
+            }
+            Err(error) => return Err(from_win32(&error)),
+        }
+    }
+    Ok(())
+}
+
+/// A raw read into title memory can be rejected if the write guard was set
+/// again during the read. Finish the unread suffix through a host buffer.
+#[cold]
+fn read_file_staged(
+    out: &mut [u8],
+    offset: u64,
+    mut read: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+) -> Result<(), HRESULT> {
+    let capacity = out.len().min(RAW_READ_STAGING_LIMIT);
+    let mut staging = Vec::new();
+    staging
+        .try_reserve_exact(capacity)
+        .map_err(|_| E_OUTOFMEMORY)?;
+    staging.resize(capacity, 0);
+    let mut done = 0;
+    while done < out.len() {
+        let at = offset.checked_add(done as u64).ok_or(E_INVALIDARG)?;
+        let len = (out.len() - done).min(capacity);
+        let n = read(&mut staging[..len], at).map_err(|error| from_win32(&error))?;
+        if n == 0 {
+            return Err(END_OF_FILE);
+        }
+        let written = &mut out[done..done + n];
+        // Refresh the destination's write watch after the blocking read.
+        victory_gpu::kernel_will_write(written.as_mut_ptr() as usize, n);
+        written.copy_from_slice(&staging[..n]);
+        done += n;
+    }
+    Ok(())
 }
 
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
@@ -1023,6 +1077,7 @@ pub(crate) fn module() -> HleModule {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use std::os::windows::ffi::OsStrExt;
     use std::time::{Duration, Instant};
 
@@ -1189,6 +1244,92 @@ mod tests {
         assert_eq!(raw, plain[5000..6000]);
         assert_eq!(inflated, plain);
         void(queue, 0x40);
+    }
+
+    #[test]
+    fn raw_file_read_stages_remaining_bytes_after_a_partial_read() {
+        let offset = 11;
+        let len = RAW_READ_STAGING_LIMIT + 41;
+        let data = pattern(offset + len + 3);
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&data).unwrap();
+
+        let mut backing = vec![0xcc; len + 2];
+        let out = &mut backing[1..=len];
+        let start = out.as_ptr().addr();
+        let destination = start..start + len;
+        let mut next_offset = offset as u64;
+        let mut direct_errors = 0;
+        let mut staged_reads = 0;
+        let result = read_file_into(out, offset as u64, true, |buf, at| {
+            assert_eq!(at, next_offset);
+            let read_len = if destination.contains(&buf.as_ptr().addr()) {
+                if at != offset as u64 {
+                    direct_errors += 1;
+                    return Err(std::io::Error::from_raw_os_error(
+                        ERROR_INVALID_USER_BUFFER as i32,
+                    ));
+                }
+                7
+            } else {
+                assert!(buf.len() <= RAW_READ_STAGING_LIMIT);
+                staged_reads += 1;
+                // A successful staged read can return fewer bytes than requested.
+                buf.len().min(RAW_READ_STAGING_LIMIT / 2)
+            };
+            let n = file.seek_read(&mut buf[..read_len], at)?;
+            next_offset += n as u64;
+            Ok(n)
+        });
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(direct_errors, 1);
+        assert_eq!(staged_reads, 3);
+        assert_eq!(&backing[1..=len], &data[offset..offset + len]);
+        assert_eq!([backing[0], backing[len + 1]], [0xcc; 2]);
+    }
+
+    #[test]
+    fn staged_raw_file_read_reports_eof() {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"abcd").unwrap();
+        let mut out = [0xcc; 5];
+        let destination = out.as_ptr();
+        let result = read_file_into(&mut out, 2, true, |buf, at| {
+            if buf.as_ptr() == destination {
+                Err(std::io::Error::from_raw_os_error(
+                    ERROR_INVALID_USER_BUFFER as i32,
+                ))
+            } else {
+                file.seek_read(buf, at)
+            }
+        });
+
+        assert_eq!(result, Err(END_OF_FILE));
+        assert_eq!(&out[..2], b"cd");
+        assert_eq!(&out[2..], &[0xcc; 3]);
+    }
+
+    #[test]
+    fn staged_fallback_preserves_read_errors() {
+        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+        for (allow_staging, code, calls) in [
+            (true, ERROR_ACCESS_DENIED, 1),
+            (false, ERROR_INVALID_USER_BUFFER, 1),
+            (true, ERROR_INVALID_USER_BUFFER, 2),
+        ] {
+            let mut out = [0xcc; 3];
+            let mut attempts = 0;
+            let result = read_file_into(&mut out, 0, allow_staging, |_, _| {
+                attempts += 1;
+                Err(std::io::Error::from_raw_os_error(code as i32))
+            });
+
+            assert_eq!(result, Err((0x8007_0000 | code) as i32));
+            assert_eq!(attempts, calls);
+            assert_eq!(out, [0xcc; 3]);
+        }
     }
 
     #[test]
