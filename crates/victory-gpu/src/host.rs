@@ -587,6 +587,48 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn drain_prewarms_only_while_the_previous_submission_runs() {
+        let Some(host) = host() else {
+            eprintln!("skipped: no host D3D12 device");
+            return;
+        };
+        let mut submitted = host.submitted.lock().unwrap();
+        for already_completed in [true, false] {
+            let written = std::cell::Cell::new(0u64);
+            let list = std::sync::Arc::new(host.new_list().unwrap());
+            list.defer_write(written.as_ptr().cast(), crate::queue::Written::Value(23), 8);
+            list.close();
+            let held_list = std::sync::Arc::downgrade(&list);
+            *submitted += 1;
+            let target = *submitted;
+            host.in_flight.lock().unwrap().push_back(InFlight {
+                fence: target,
+                submission: 0,
+                _early_copies: Vec::new(),
+                _plans: Vec::new(),
+                finish: Some(Finish { lists: vec![list], back: Vec::new() }),
+            });
+            let complete = || {
+                // SAFETY: submit is serialized. This synthetic run stands in
+                // for the direct queue's signal with no GPU commands to run.
+                unsafe { host.fence.Signal(target).unwrap() };
+            };
+            if already_completed {
+                complete();
+            }
+            let mut during_prewarm = None;
+            host.drain_in_flight_locked(Some(|| {
+                during_prewarm = Some((written.get(), held_list.strong_count()));
+                complete();
+            }));
+            assert_eq!(during_prewarm, (!already_completed).then_some((0, 1)));
+            assert_eq!(written.get(), 23);
+            assert!(held_list.upgrade().is_none());
+            assert!(!host.has_in_flight());
+        }
+    }
+
     /// A list with no work before its waits, as the title's queues meet one
     /// another halfway: each write goes as soon as the waits before it are
     /// met, and work holds the later ones back.
@@ -1130,12 +1172,15 @@ impl Host {
         }
     }
 
-    /// Finishes the unwaited submissions that have run, oldest first, and
+    fn completed_fence(&self) -> u64 {
+        // SAFETY: a plain fence query.
+        unsafe { self.fence.GetCompletedValue() }
+    }
+
+    /// Finishes the unwaited submissions through `completed`, oldest first, and
     /// buries objects retired before them. The caller holds `submitted`:
     /// finishing puts back what shaders wrote, as a submission does.
-    fn reap_completed(&self) {
-        // SAFETY: a plain fence query.
-        let completed = unsafe { self.fence.GetCompletedValue() };
+    fn reap_completed(&self, completed: u64) {
         let mut last_sub = 0u64;
         loop {
             let done = {
@@ -1187,7 +1232,7 @@ impl Host {
                 }
             }
         }
-        self.reap_completed();
+        self.reap_completed(self.completed_fence());
     }
 
     /// Waits for all in-flight asynchronous submissions to complete.
@@ -1204,8 +1249,9 @@ impl Host {
         }
     }
 
-    /// Waits for any in-flight async submission while `self.submitted` is already held.
-    fn drain_in_flight_locked(&self) {
+    /// Finishes the previous async submission while `submitted` is held.
+    /// Runs optional preparation only if there is still GPU work to overlap.
+    fn drain_in_flight_locked(&self, prewarm: Option<impl FnOnce()>) {
         let target = self
             .in_flight
             .lock()
@@ -1216,19 +1262,26 @@ impl Host {
         if target == 0 {
             return;
         }
-        // SAFETY: the fence and event are ours; caller holds `submitted`.
-        unsafe {
-            if self.fence.GetCompletedValue() < target {
-                let waited = std::time::Instant::now();
+        let mut completed = self.completed_fence();
+        if completed < target && let Some(prewarm) = prewarm {
+            prewarm();
+            completed = self.completed_fence();
+        }
+        if completed < target {
+            let waited = std::time::Instant::now();
+            // SAFETY: the fence and its auto-reset event are ours, and the
+            // caller holds `submitted` from event registration through wait.
+            unsafe {
                 if let Err(e) = self.fence.SetEventOnCompletion(target, self.event) {
                     tracing::warn!(error = %e, "host async drain failed");
                 } else {
                     WaitForSingleObject(self.event, INFINITE);
                 }
-                SUBMISSION_US[1].fetch_add(waited.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
+            SUBMISSION_US[1].fetch_add(waited.elapsed().as_micros() as u64, Ordering::Relaxed);
+            completed = self.completed_fence();
         }
-        self.reap_completed();
+        self.reap_completed(completed);
     }
 
     /// Runs closed lists; waits synchronously when CPU copy-back, readbacks, or
@@ -1288,10 +1341,7 @@ impl Host {
         // buffers in `prepare`. During the gap between submissions, the GPU
         // ran in parallel with the title's CPU command-list recording, and
         // runs on while this submission's buffer copies are refreshed.
-        if keep.is_some() && self.has_in_flight() {
-            self.prewarm(runs);
-        }
-        self.drain_in_flight_locked();
+        self.drain_in_flight_locked(keep.is_some().then_some(|| self.prewarm(runs)));
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
