@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{E_OUTOFMEMORY, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -707,6 +707,95 @@ mod tests {
         }
     }
 
+    #[test]
+    fn scratch_oom_retry_uploads_and_keeps_a_smaller_buffer() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        let free = Mutex::default();
+        let data: Vec<u8> = (0..333).map(|i| (i * 37) as u8).collect();
+        let len = data.len() as u64;
+        let (readback, downloaded) = list.readback(host, len).unwrap();
+        let mut attempted = Vec::new();
+        let sizes = list
+            .try_scratch_in(
+                len,
+                512,
+                &free,
+                |size| {
+                    attempted.push(size);
+                    if size == SCRATCH_CHUNK {
+                        return Err(windows::core::Error::from_hresult(E_OUTOFMEMORY));
+                    }
+                    host.try_upload_buffer(size)
+                },
+                |buffer, at, gpu, to| {
+                    assert_eq!(at, 0);
+                    assert_eq!(gpu % 256, 0);
+                    // SAFETY: both buffers are live, and the copy fits their ranges.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(data.as_ptr(), to, data.len());
+                        list.list.CopyBufferRegion(&readback, 0, buffer, at, len);
+                        let small = buffer.GetDesc();
+                        let chunk = D3D12_RESOURCE_DESC { Width: SCRATCH_CHUNK, ..small };
+                        [small, chunk].map(|desc| {
+                            host.device.GetResourceAllocationInfo(0, &[desc]).SizeInBytes
+                        })
+                    }
+                },
+            )
+            .unwrap();
+        let minimum = u64::from(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+        assert_eq!(attempted, [SCRATCH_CHUNK, minimum]);
+        assert_eq!(sizes[0], minimum);
+        assert!(sizes[0] < sizes[1], "committed allocation sizes: {sizes:?}");
+        assert!(list.scratch.lock().unwrap().chunks.is_empty());
+        assert_eq!(list.deferred().uploads.len(), 2); // upload and readback
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the submission finished and the readback buffer is live.
+        assert_eq!(unsafe { std::slice::from_raw_parts(downloaded, data.len()) }, data);
+        list.reset();
+        assert!(list.deferred().uploads.is_empty());
+        println!(
+            "D3D12 upload of {len} bytes: {} KiB chunk refused, {} KiB allocation used ({} KiB for the chunk); readback matched",
+            SCRATCH_CHUNK >> 10, sizes[0] >> 10, sizes[1] >> 10,
+        );
+    }
+
+    #[test]
+    fn scratch_retries_only_oom_and_only_when_the_allocation_shrinks() {
+        use windows::Win32::Foundation::E_INVALIDARG;
+
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        let free = Mutex::default();
+        let minimum = u64::from(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+        for (len, first, expected) in [
+            (333, E_INVALIDARG, &[SCRATCH_CHUNK][..]),
+            (SCRATCH_CHUNK - 256, E_OUTOFMEMORY, &[SCRATCH_CHUNK][..]),
+            (333, E_OUTOFMEMORY, &[SCRATCH_CHUNK, minimum][..]),
+        ] {
+            let mut attempted = Vec::new();
+            let (size, error) = list
+                .try_scratch_in(
+                    len,
+                    256,
+                    &free,
+                    |size| {
+                        attempted.push(size);
+                        let code = if size == SCRATCH_CHUNK { first } else { E_INVALIDARG };
+                        Err(windows::core::Error::from_hresult(code))
+                    },
+                    |_, _, _, _| panic!("no attempt allocated"),
+                )
+                .unwrap_err();
+            assert_eq!(attempted, expected);
+            assert_eq!(size, *expected.last().unwrap());
+            assert_eq!(error.code(), if size == SCRATCH_CHUNK { first } else { E_INVALIDARG });
+            assert!(list.deferred().uploads.is_empty());
+        }
+    }
+
     /// A list with no work before its waits, as the title's queues meet one
     /// another halfway: each write goes as soon as the waits before it are
     /// met, and work holds the later ones back.
@@ -998,11 +1087,14 @@ pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
     }
 }
 
+/// A mapped upload buffer, its CPU address and its GPU address.
+type ScratchChunk = (ID3D12Resource, usize, u64);
+
 /// Upload chunks handed out front to back: the chunks, the one in use and
 /// the bytes used in it.
 #[derive(Default)]
 struct Scratch {
-    chunks: Vec<(ID3D12Resource, usize, u64)>,
+    chunks: Vec<ScratchChunk>,
     current: usize,
     used: u64,
 }
@@ -1015,7 +1107,7 @@ const SCRATCH_CHUNK: u64 = 512 << 10;
 /// Scratch chunks no list uses: lists give theirs back when reset. Each list
 /// keeping the chunks of its largest use added up to gigabytes, as the title
 /// has hundreds of lists.
-static SCRATCH_FREE: Mutex<Vec<(ID3D12Resource, usize, u64)>> = Mutex::new(Vec::new());
+static SCRATCH_FREE: Mutex<Vec<ScratchChunk>> = Mutex::new(Vec::new());
 /// Free chunks kept; more are released.
 const SCRATCH_KEPT: usize = 256;
 
@@ -2733,31 +2825,54 @@ impl HostList {
         f: impl FnOnce(&ID3D12Resource, u64, u64, *mut u8) -> R,
     ) -> Option<R> {
         let host = host()?;
+        self.try_scratch_in(len, align, &SCRATCH_FREE, |size| host.try_upload_buffer(size), f)
+            .map_err(|(size, error)| host.report_upload_error(size, &error))
+            .ok()
+    }
+
+    fn try_scratch_in<R>(
+        &self,
+        len: u64,
+        align: u64,
+        free: &Mutex<Vec<ScratchChunk>>,
+        mut make: impl FnMut(u64) -> windows::core::Result<(ID3D12Resource, *mut u8)>,
+        f: impl FnOnce(&ID3D12Resource, u64, u64, *mut u8) -> R,
+    ) -> Result<R, (u64, windows::core::Error)> {
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
-            let (buffer, data) = host.upload_buffer(len)?;
-            name(&buffer, || format!("list scratch {len:#x}"));
-            // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            let made = f(&buffer, 0, gpu, data);
-            self.deferred().uploads.push(buffer);
-            return Some(made);
+            return self.dedicated_scratch(len, make, f);
         }
         if s.used.next_multiple_of(align) + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
-            let free = SCRATCH_FREE.lock().unwrap_or_else(|e| e.into_inner()).pop();
+            // Committed buffers are charged in 64 KiB units. A retry must
+            // reduce that charge and report its full size to the allocator.
+            let dedicated_size =
+                len.next_multiple_of(u64::from(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT));
+            let free = free.lock().unwrap_or_else(|e| e.into_inner()).pop();
             let chunk = match free {
                 Some(chunk) => chunk,
-                None => {
-                    let (buffer, data) = host.upload_buffer(SCRATCH_CHUNK)?;
-                    name(&buffer, || "list scratch".into());
-                    // SAFETY: a live buffer.
-                    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-                    (buffer, data as usize, gpu)
-                }
+                None => match make(SCRATCH_CHUNK) {
+                    Ok((buffer, data)) => {
+                        name(&buffer, || "list scratch".into());
+                        // SAFETY: a live buffer.
+                        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                        (buffer, data as usize, gpu)
+                    }
+                    Err(error) if error.code() == E_OUTOFMEMORY && dedicated_size < SCRATCH_CHUNK => {
+                        // Try a smaller committed allocation. Keep it out of
+                        // the pool, whose chunks all have the same size.
+                        let made = self.dedicated_scratch(dedicated_size, make, f)?;
+                        tracing::debug!(
+                            size = dedicated_size,
+                            "list scratch allocated after chunk ran out of memory"
+                        );
+                        return Ok(made);
+                    }
+                    Err(error) => return Err((SCRATCH_CHUNK, error)),
+                },
             };
             s.chunks.push(chunk);
             s.used = 0;
@@ -2766,7 +2881,23 @@ impl HostList {
         let at = s.used.next_multiple_of(align);
         let made = f(buffer, at, gpu + at, (data + at as usize) as *mut u8);
         s.used = at + len;
-        Some(made)
+        Ok(made)
+    }
+
+    /// Keeps a dedicated upload alive until this list's fence and reset.
+    fn dedicated_scratch<R>(
+        &self,
+        len: u64,
+        make: impl FnOnce(u64) -> windows::core::Result<(ID3D12Resource, *mut u8)>,
+        f: impl FnOnce(&ID3D12Resource, u64, u64, *mut u8) -> R,
+    ) -> Result<R, (u64, windows::core::Error)> {
+        let (buffer, data) = make(len).map_err(|error| (len, error))?;
+        name(&buffer, || format!("list scratch {len:#x}"));
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let made = f(&buffer, 0, gpu, data);
+        self.deferred().uploads.push(buffer);
+        Ok(made)
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
@@ -3570,6 +3701,17 @@ impl Host {
     /// 85% of the live VRAM budget) or standard upload heap, mapped for CPU
     /// writing.
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.try_upload_buffer(size)
+            .map_err(|error| self.report_upload_error(size, &error))
+            .ok()
+    }
+
+    fn report_upload_error(&self, size: u64, error: &windows::core::Error) {
+        wait_if_removed(&self.device, error);
+        tracing::warn!(%error, size, "no upload buffer");
+    }
+
+    fn try_upload_buffer(&self, size: u64) -> windows::core::Result<(ID3D12Resource, *mut u8)> {
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: size.max(1),
@@ -3612,24 +3754,15 @@ impl Host {
             };
             made.map(|()| (buffer, data))
         };
-        let made = if use_gpu_upload {
+        let (buffer, data) = if use_gpu_upload {
             try_make(D3D12_HEAP_TYPE_GPU_UPLOAD, D3D12_RESOURCE_STATE_COMMON)
                 .or_else(|_| try_make(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ))
         } else {
             try_make(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ)
-        };
-        match made {
-            Ok((buffer, data)) => {
-                let buffer = buffer?;
-                crate::memstat::track(&buffer, 0, size);
-                Some((buffer, data.cast()))
-            }
-            Err(e) => {
-                wait_if_removed(&self.device, &e);
-                tracing::warn!(error = %e, size, "no upload buffer");
-                None
-            }
-        }
+        }?;
+        let buffer = buffer.ok_or_else(windows::core::Error::empty)?;
+        crate::memstat::track(&buffer, 0, size);
+        Ok((buffer, data.cast()))
     }
 
     /// A buffer in the readback heap, mapped for reading.
