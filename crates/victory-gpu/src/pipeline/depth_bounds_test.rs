@@ -53,6 +53,28 @@ fn fullscreen_vertex_shader() -> Arc<Shader> {
     host_shader("vertex", victory_shader::HwStage::Vs, bytes)
 }
 
+pub(crate) fn synthetic_triangle_pipeline() -> This {
+    let mut graphics = host::GraphicsState::default();
+    let topology = [14, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0 as u32];
+    let depth = [16, DXGI_FORMAT_D32_FLOAT.0 as u32];
+    // SAFETY: each array is a complete stream subobject of the given kind.
+    unsafe {
+        graphics.read(14, topology.as_ptr().cast());
+        graphics.read(16, depth.as_ptr().cast());
+    }
+    let mut pipeline = std::ptr::null();
+    assert_eq!(
+        hand_out(
+            vec![fullscreen_vertex_shader()],
+            Some(Box::new(graphics)),
+            &PIPELINE_IIDS[0],
+            &mut pipeline,
+        ),
+        S_OK
+    );
+    pipeline
+}
+
 fn host_shader(stage: &'static str, hw_stage: victory_shader::HwStage, bytes: &[u8]) -> Arc<Shader> {
     let shader = shader(stage, bytes);
     shader.translated.get_or_init(|| Some(Translated {

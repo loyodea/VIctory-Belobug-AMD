@@ -1834,6 +1834,10 @@ impl State {
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };
+                // The clamp replaced these bindings even if rectangle
+                // expansion below rejects the draw.
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
                 (bounded, 0)
             }
         };
@@ -1853,10 +1857,6 @@ impl State {
                     return false;
                 }
             }
-        }
-        if inline {
-            self.host_pipeline = 0;
-            self.host_roots[1] = 0;
         }
         let ran = match kind {
             DRAW if rect_args.is_some() => {
@@ -2183,5 +2183,46 @@ mod group_limit_tests {
         assert!(!super::dispatch_fits(65_536, 1, 1));
         assert!(!super::dispatch_fits(1, u32::MAX, 1));
         assert!(!super::dispatch_fits(1, 1, 65_536));
+    }
+}
+
+#[cfg(test)]
+mod indirect_tests {
+    use super::*;
+    use crate::object::slot;
+
+    #[test]
+    fn rejected_indexed_rectangle_leaves_the_inline_pipeline_cache_invalidated() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipped inline indirect state test: no host D3D12 device");
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let pipeline = crate::pipeline::depth_bounds_test::synthetic_triangle_pipeline();
+        let mut state = State::default();
+        state.set_pipeline(pipeline);
+        state.set_topology(&list, RECTANGLES);
+        assert!(state.prepare(&list, false));
+        assert_ne!(state.host_pipeline, 0);
+        let graphics_root = state.host_roots[0];
+
+        // A zero-work indexed argument still records the inline clamp, then
+        // reaches the unsupported indexed rectangle path.
+        let arguments = crate::resource::test_buffer(20);
+        let (bytes, _) = crate::resource::buffer_bytes(arguments).unwrap();
+        // SAFETY: this buffer owns a writable 20-byte indexed argument.
+        unsafe { bytes.write_bytes(0, 20) };
+        let ran = state.execute_indirect(&list, (1, 20, 1), bytes as u64, None);
+        list.close();
+        let release = |object| slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        assert_eq!(release(arguments), 0);
+        assert_eq!(release(pipeline), 0);
+
+        assert!(!ran);
+        assert_eq!(
+            state.host_pipeline, 0,
+            "the clamp replaced the graphics PSO"
+        );
+        assert_eq!(state.host_roots[0], graphics_root);
     }
 }

@@ -869,4 +869,4 @@ mod tests {
 }
 
 #[cfg(all(test, windows))]
-mod depth_bounds_test;
+pub(crate) mod depth_bounds_test;
