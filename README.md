@@ -145,6 +145,14 @@ victory run <game_scarlett_master.exe> --execute --console series-x
 The first launch after a build translates every shader and builds about
 2,500 pipelines; the loading screen can stay frozen, with sound, for minutes.
 
+If Wine or Proton's shader compiler cannot build the indirect argument
+clamp, VIctory retries with Microsoft's DirectX Shader Compiler (DXC).
+Use the x64 `dxcompiler.dll` from the [May 2025 DXC release or
+newer](https://github.com/microsoft/DirectXShaderCompiler/releases).
+Place it beside `victory.exe` or set `VICTORY_DXC` to its absolute
+Windows path. The fallback needs Shader Model 6.0 support from the
+D3D12 runtime.
+
 ### Known problems
 
 - With the in-game phone out the world is unlit (see the table).

@@ -4,9 +4,9 @@
 //! billion vertices or a dispatch past the host's limits runs until the
 //! host resets the display driver. So active records are copied and clamped
 //! on the GPU into a device-local scratch buffer, just before execution, by a
-//! compute shader of ours (HLSL compiled by the system's compiler; a 5.1
-//! shader with its root signature inside), leaving the title's argument and
-//! count buffers untouched.
+//! compute shader of ours, leaving the title's argument and count buffers
+//! untouched. FXC builds a 5.1 shader where available, with DXC as a 6.0
+//! fallback. Both include the same root signature.
 //!
 //! When a count buffer is given, threads at or past `min(max, count)` return
 //! immediately without charging the list's budget or reading uninitialized
@@ -20,10 +20,23 @@
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
+use std::os::windows::ffi::OsStrExt;
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use windows::Win32::Foundation::FARPROC;
+use windows::Win32::Graphics::Direct3D::Dxc::{
+    CLSID_DxcCompiler, DXC_CP_UTF8, DxcBuffer, DxcCreateInstanceProc, IDxcCompiler3,
+    IDxcIncludeHandler, IDxcResult,
+};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::s;
+use windows::Win32::System::LibraryLoader::{
+    GetProcAddress, LOAD_LIBRARY_SEARCH_APPLICATION_DIR, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+    LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+};
+use windows::core::{Interface, Owned, PCSTR, PCWSTR, s, w};
 
 use crate::host::{HostList, host, transition};
 
@@ -133,27 +146,42 @@ fn clamp() -> Option<&'static Clamp> {
         .get_or_init(|| match make() {
             Ok(c) => Some(c),
             Err(e) => {
-                tracing::warn!(error = %e, "no argument clamp: indirect execution dropped");
+                tracing::warn!(error = format_args!("{e:#}"), "no argument clamp: indirect execution dropped");
                 None
             }
         })
         .as_ref()
 }
 
-fn make() -> windows::core::Result<Clamp> {
-    let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    make_for(device)
+fn make() -> Result<Clamp> {
+    let device = &host().context("no host device")?.device;
+    make_compute_pipeline(device, s!("clamp"), SOURCE)
 }
 
-fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+fn make_compute_pipeline(device: &ID3D12Device, name: PCSTR, source: &str) -> Result<Clamp> {
+    // Wine's FXC can reject the raw buffer operations or omit the root signature.
+    let fxc = compile_fxc(name, source).and_then(|code| pipeline_from_shader(device, &code));
+    match fxc {
+        Ok(pipeline) => Ok(pipeline),
+        Err(fxc_error) => {
+            let pipeline = compile_dxc(source)
+                .and_then(|code| pipeline_from_shader(device, &code))
+                .with_context(|| format!("FXC failed ({fxc_error:#}); DXC fallback failed"))?;
+            tracing::debug!(error = %fxc_error, "built indirect compute pipeline with DXC");
+            Ok(pipeline)
+        }
+    }
+}
+
+fn compile_fxc(name: PCSTR, source: &str) -> Result<Vec<u8>> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
-            s!("clamp"),
+            source.as_ptr().cast(),
+            source.len(),
+            name,
             None,
             None,
             s!("main"),
@@ -164,25 +192,93 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
             Some(&mut errors),
         )
     };
-    if let Err(e) = compiled {
-        if let Some(errors) = errors {
-            // SAFETY: the blob's own bytes.
-            let text = unsafe {
-                std::slice::from_raw_parts(
-                    errors.GetBufferPointer().cast::<u8>(),
-                    errors.GetBufferSize(),
-                )
-            };
-            tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
+    compiled.with_context(|| match errors {
+        Some(errors) => {
+            // SAFETY: the blob owns the bytes for the duration of the copy.
+            let text = unsafe { copy_blob(errors.GetBufferPointer(), errors.GetBufferSize()) };
+            compiler_message(&text)
         }
-        return Err(e);
-    }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+        None => "D3DCompile failed".into(),
+    })?;
+    let code = code.context("FXC returned no shader")?;
+    // SAFETY: the blob owns the bytes for the duration of the copy.
+    Ok(unsafe { copy_blob(code.GetBufferPointer(), code.GetBufferSize()) })
+}
+
+fn compile_dxc(source: &str) -> Result<Vec<u8>> {
+    let override_path = std::env::var_os("VICTORY_DXC");
+    // SAFETY: the names passed to the loader are NUL-terminated.
+    let module = unsafe {
+        let handle = if let Some(path) = override_path.as_deref() {
+            anyhow::ensure!(Path::new(path).is_absolute(), "VICTORY_DXC must be an absolute DLL path");
+            let name: Vec<_> = path.encode_wide().chain([0]).collect();
+            LoadLibraryExW(
+                PCWSTR(name.as_ptr()),
+                None,
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+            .with_context(|| format!("could not load DXC at {}", Path::new(path).display()))?
+        } else {
+            LoadLibraryExW(
+                w!("dxcompiler.dll"),
+                None,
+                LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+            .context("could not load dxcompiler.dll beside the executable or in System32")?
+        };
+        Owned::new(handle)
+    };
+
+    let input = DxcBuffer {
+        Ptr: source.as_ptr().cast(),
+        Size: source.len(),
+        Encoding: DXC_CP_UTF8.0,
+    };
+    let arguments = [
+        w!("-E"), w!("main"), w!("-T"), w!("cs_6_0"), w!("-HV"), w!("2021"),
+        w!("-force-rootsig-ver"), w!("rootsig_1_1"),
+    ];
+    // SAFETY: the library stays loaded until all compiler objects are dropped.
+    // The export signature matches dxcapi.h. The inputs live through Compile.
     unsafe {
-        let bytes =
-            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+        let create = std::mem::transmute::<FARPROC, DxcCreateInstanceProc>(GetProcAddress(
+            *module,
+            s!("DxcCreateInstance"),
+        ))
+        .context("dxcompiler.dll lacks DxcCreateInstance")?;
+        let mut compiler: Option<IDxcCompiler3> = None;
+        create(&CLSID_DxcCompiler, &IDxcCompiler3::IID, (&mut compiler as *mut Option<IDxcCompiler3>).cast())
+            .ok()
+            .context("could not create a DXC compiler")?;
+        let compiler = compiler.context("DxcCreateInstance returned no compiler")?;
+        let result: IDxcResult = compiler.Compile(&input, Some(&arguments), None::<&IDxcIncludeHandler>)?;
+        result.GetStatus()?.ok().with_context(|| match result.GetErrorBuffer() {
+            Ok(errors) => compiler_message(&copy_blob(errors.GetBufferPointer(), errors.GetBufferSize())),
+            Err(_) => "DXC rejected the shader".into(),
+        })?;
+        let code = result.GetResult()?;
+        Ok(copy_blob(code.GetBufferPointer(), code.GetBufferSize()))
+    }
+}
+
+/// The caller keeps the blob with these bytes alive through the copy.
+unsafe fn copy_blob(ptr: *const std::ffi::c_void, len: usize) -> Vec<u8> {
+    if len == 0 {
+        return Vec::new();
+    }
+    // SAFETY: the caller provides the live blob's nonempty buffer.
+    unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) }.to_vec()
+}
+
+fn compiler_message(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).trim_end_matches('\0').trim().to_owned()
+}
+
+fn pipeline_from_shader(device: &ID3D12Device, bytes: &[u8]) -> Result<Clamp> {
+    // SAFETY: the blob's bytes live through both calls; it has an embedded root signature.
+    unsafe {
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)
+            .context("could not create the indirect root signature")?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
@@ -190,7 +286,7 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
                 BytecodeLength: bytes.len(),
             },
             ..Default::default()
-        })?;
+        }).context("could not create the indirect compute pipeline")?;
         Ok(Clamp { root, pso })
     }
 }
@@ -505,7 +601,7 @@ void main() {
     }
 
     impl WarpHarness {
-        fn new() -> Option<Self> {
+        fn new(clamp_source: &str, worker_source: &str) -> Option<Self> {
             // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
             unsafe {
                 let factory: IDXGIFactory4 =
@@ -532,8 +628,10 @@ void main() {
                     .ok()?;
                 let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
                 let event = CreateEventW(None, false, false, None).ok()?;
-                let clamp = make_for(&device).expect("clamp shader must compile on WARP");
-                let worker = compile_cs(&device, WORKER_CS).expect("worker shader must compile");
+                let clamp = make_compute_pipeline(&device, s!("clamp"), clamp_source)
+                    .expect("clamp shader must compile on WARP");
+                let worker = make_compute_pipeline(&device, s!("worker"), worker_source)
+                    .expect("worker shader must compile");
                 Some(Self {
                     device,
                     queue,
@@ -667,41 +765,6 @@ void main() {
         }
     }
 
-    fn compile_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: source and entry names outlive `D3DCompile`.
-        unsafe {
-            D3DCompile(
-                source.as_ptr().cast(),
-                source.len(),
-                s!("worker"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-            let code = code.unwrap();
-            let bytes = std::slice::from_raw_parts(
-                code.GetBufferPointer().cast::<u8>(),
-                code.GetBufferSize(),
-            );
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
-            let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::transmute_copy(&root),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: bytes.as_ptr().cast(),
-                    BytecodeLength: bytes.len(),
-                },
-                ..Default::default()
-            })?;
-            Ok(Clamp { root, pso })
-        }
-    }
-
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
@@ -741,9 +804,13 @@ void main() {
     ///     records into `dst_args` at offset `0`.
     #[test]
     fn warp_count_buffer_ignores_garbage_tail_and_preserves_source() {
-        let Some(mut warp) = WarpHarness::new() else {
+        let Some(warp) = WarpHarness::new(SOURCE, WORKER_CS) else {
             return;
         };
+        check_count_buffer(warp);
+    }
+
+    fn check_count_buffer(mut warp: WarpHarness) {
         const KIND_DISPATCH: u32 = 2;
         const STRIDE: u32 = 24; // 6 dwords: 3 dispatch group counts + 3 extra payload dwords
         const MAX: u32 = 4096;
@@ -946,9 +1013,13 @@ void main() {
     /// `src_args` untouched.
     #[test]
     fn warp_budget_saturates_without_wraparound_and_preserves_draw_fields() {
-        let Some(mut warp) = WarpHarness::new() else {
+        let Some(warp) = WarpHarness::new(SOURCE, WORKER_CS) else {
             return;
         };
+        check_budget(warp);
+    }
+
+    fn check_budget(mut warp: WarpHarness) {
         const KIND_INDEXED: u32 = 1;
         const STRIDE: u32 = 24; // 5 indexed-draw words + 1 trailing custom word
         const RECORDS: u32 = 128; // 2 waves of 64: old InterlockedAdd wrapped 2^32 at 64!
@@ -1045,6 +1116,41 @@ void main() {
             assert_eq!(rec[5], 0xCAFE_0000 | (i as u32));
         }
         assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
+    }
+
+    #[test]
+    fn warp_dxc_fallback_preserves_clamp_and_worker() {
+        use victory_shader::{Container, FourCC};
+
+        if std::env::var_os("VICTORY_DXC").is_none() {
+            eprintln!("skipped: set VICTORY_DXC to test the DXC fallback");
+            return;
+        }
+        // DXC defines __HLSL_VERSION. Force FXC to reject the test shaders
+        // without changing their HLSL instructions or resource declarations.
+        let only_dxc = |source| format!("#ifndef __HLSL_VERSION\n#error DXC required\n#endif\n{source}");
+        let clamp = only_dxc(SOURCE);
+        let worker = only_dxc(WORKER_CS);
+        for (source, fallback_source) in [(SOURCE, &clamp), (WORKER_CS, &worker)] {
+            assert!(compile_fxc(s!("fallback"), fallback_source).is_err());
+            let dxil = compile_dxc(fallback_source).unwrap();
+            let dxc = Container::parse(&dxil).unwrap();
+            let dxc_root = dxc.part(FourCC::RTS0).unwrap();
+            assert!(dxc.part(FourCC::DXIL).is_some());
+            if let Ok(dxbc) = compile_fxc(s!("native"), source) {
+                let fxc = Container::parse(&dxbc).unwrap();
+                if let Some(fxc_root) = fxc.part(FourCC::RTS0) {
+                    assert_eq!(fxc_root.data, dxc_root.data);
+                    eprintln!("FXC and DXC root signatures match");
+                }
+            }
+        }
+        let Some(warp) = WarpHarness::new(&clamp, &worker) else {
+            eprintln!("WARP unavailable; checked DXC compilation only");
+            return;
+        };
+        check_count_buffer(warp);
+        check_budget(WarpHarness::new(&clamp, &worker).unwrap());
     }
 
     /// Exercises `HostList::indirect_scratch`, `bound`, `done`, `Host::execute`,
