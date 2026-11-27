@@ -52,6 +52,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
 
+use windows::Win32::Foundation::E_INVALIDARG;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
 
@@ -72,6 +73,10 @@ pub(super) fn folder() -> Option<PathBuf> {
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
+/// Library lookup misses, other load failures, and failed stores since the start.
+static LOAD_MISSES: AtomicU64 = AtomicU64::new(0);
+static LOAD_FAILURES: AtomicU64 = AtomicU64::new(0);
+static STORE_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// For the memory lines: the bytes of the library's file, kept in memory
 /// while the library lives, and the bytes the last save wrote (a buffer of
 /// that size is made, filled and written every time pipelines were added,
@@ -309,6 +314,13 @@ pub(crate) fn removal_note() -> String {
             );
         }
     }
+    let _ = write!(
+        text,
+        ", {} load misses, {} other load failures, {} store failures",
+        LOAD_MISSES.load(Ordering::Relaxed),
+        LOAD_FAILURES.load(Ordering::Relaxed),
+        STORE_FAILURES.load(Ordering::Relaxed)
+    );
     let (at, len) = (VIEW[0].load(Ordering::Relaxed), VIEW[1].load(Ordering::Relaxed));
     if at == 0 {
         text.push_str("; its file is not mapped");
@@ -529,7 +541,7 @@ pub(crate) fn pipeline(
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
-    let began = std::time::Instant::now();
+    let load_started = std::time::Instant::now();
     let loaded = {
         let mut loading = crate::timeline::span("pipeline: acquire library load guards");
         let _all = one_call();
@@ -538,6 +550,7 @@ pub(crate) fn pipeline(
         loading.next("pipeline: load a PSO from the driver library");
         load(&library.library, PCWSTR(wide.as_ptr()))
     };
+    let load_ms = load_started.elapsed().as_secs_f64() * 1e3;
     // The load read the library's file (see `trim`).
     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
     TRIMMED.store(false, Ordering::Relaxed);
@@ -546,34 +559,53 @@ pub(crate) fn pipeline(
             LOADED.fetch_add(1, Ordering::Relaxed);
             crate::host::trail(|| {
                 let label = LABEL.with(|l| l.borrow().clone());
-                format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
+                format!("pipeline library: loaded {name} {label} in {load_ms:.1} ms")
             });
             return Ok(pso);
         }
         Err(e) => e,
     };
+    // D3D12 returns E_INVALIDARG for a missing name or a different description.
+    let lookup = if refused.code() == E_INVALIDARG {
+        LOAD_MISSES.fetch_add(1, Ordering::Relaxed);
+        "load miss"
+    } else {
+        LOAD_FAILURES.fetch_add(1, Ordering::Relaxed);
+        "load failure"
+    };
     // Compiled outside any lock: compiles take up to seconds.
-    let pso = {
+    let (pso, create_ms) = {
         let _call = call("make", name);
-        create()?
+        let started = std::time::Instant::now();
+        let pso = create()?;
+        (pso, started.elapsed().as_secs_f64() * 1e3)
     };
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
         format!(
-            "pipeline library: made {label} in {:.1} ms (the library did not load it: {refused})",
-            began.elapsed().as_secs_f64() * 1e3
+            "pipeline library: made {name} {label} in {create_ms:.1} ms ({lookup} after {load_ms:.1} ms: {refused})"
         )
     });
-    let mut storing = crate::timeline::span("pipeline: acquire library store guards");
-    let _all = one_call();
-    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
-    let _call = call("store", name);
-    storing.next("pipeline: store a PSO in the driver library");
-    // SAFETY: a live pipeline; a name already stored (a description that
-    // differs) is refused, which leaves the library as it was.
-    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
-        library.added.fetch_add(1, Ordering::Relaxed);
+    let stored = {
+        let mut storing = crate::timeline::span("pipeline: acquire library store guards");
+        let _all = one_call();
+        let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
+        let _call = call("store", name);
+        storing.next("pipeline: store a PSO in the driver library");
+        // SAFETY: a live pipeline. A name already stored is refused.
+        let stored = unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) };
+        if stored.is_ok() {
+            library.added.fetch_add(1, Ordering::Relaxed);
+        }
+        stored
+    };
+    if let Err(error) = stored {
+        STORE_FAILURES.fetch_add(1, Ordering::Relaxed);
+        crate::host::trail(|| {
+            let label = LABEL.with(|l| l.borrow().clone());
+            format!("pipeline library: store failed for {name} {label}: {error}")
+        });
     }
     Ok(pso)
 }
@@ -805,6 +837,60 @@ mod tests {
         assert_ne!(a, name("mesh", b"root", &[b"vs", b"ps"], "state"));
         // Parts do not run into each other.
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
+    }
+
+    #[test]
+    fn load_misses_and_store_failures_are_counted_separately() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("no host GPU; skipped");
+            return;
+        };
+        let Some(library) = library() else {
+            eprintln!("no host pipeline library; skipped");
+            return;
+        };
+        // Both descriptions are valid. Using one name for both lets the
+        // second description miss the cache and then run into the old entry.
+        let make = |threads| {
+            let code = crate::host::compile(
+                &format!(r#"[RootSignature("")] [numthreads({threads}, 1, 1)] void main() {{}}"#),
+                windows::core::s!("main"),
+                windows::core::s!("cs_5_1"),
+            )
+            .unwrap();
+            // SAFETY: the compiled shader contains its root signature.
+            let root: ID3D12RootSignature = unsafe { host.device.CreateRootSignature(0, &code) }.unwrap();
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                // SAFETY: borrowed from `root`, which outlives the description.
+                pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: code.as_ptr().cast(),
+                    BytecodeLength: code.len(),
+                },
+                ..Default::default()
+            };
+            pipeline(
+                "load-and-store-diagnostics-test",
+                // SAFETY: the description points at live data.
+                |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
+                // SAFETY: as above.
+                || unsafe { host.device.CreateComputePipelineState(&desc) },
+            )
+            .unwrap();
+        };
+        let misses = LOAD_MISSES.load(Ordering::Relaxed);
+        let added = library.added.load(Ordering::Relaxed);
+        make(1);
+        assert!(LOAD_MISSES.load(Ordering::Relaxed) > misses);
+        assert!(library.added.load(Ordering::Relaxed) > added);
+        let loaded = LOADED.load(Ordering::Relaxed);
+        make(1);
+        assert!(LOADED.load(Ordering::Relaxed) > loaded);
+        let misses = LOAD_MISSES.load(Ordering::Relaxed);
+        let store_failures = STORE_FAILURES.load(Ordering::Relaxed);
+        make(2);
+        assert!(LOAD_MISSES.load(Ordering::Relaxed) > misses);
+        assert!(STORE_FAILURES.load(Ordering::Relaxed) > store_failures);
     }
 
     #[test]
