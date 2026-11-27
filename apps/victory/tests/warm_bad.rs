@@ -74,11 +74,20 @@ fn warm_bad_fingerprint_override_again_and_help() {
 
     let fp_entry = format!("{k_fp_bad} fp={fp_base} exit code: 0xc0000005");
     assert_eq!(fp_entry.split(' ').next(), Some(k_fp_bad.as_str()));
-    fs::write(
-        pipelines.join("warm-bad.txt"),
-        format!("\n# comment line\n   # indented comment\n{fp_entry}\n\t{k_legacy_bad}\tlegacy crash\n"),
-    )
-    .unwrap();
+    let bad_file = pipelines.join("warm-bad.txt");
+    let bad_entries = format!("\n# comment line\n   # indented comment\n{fp_entry}\n\t{k_legacy_bad}\tlegacy crash\n");
+    fs::write(&bad_file, &bad_entries).unwrap();
+
+    // Two used pipelines are eligible with the override. The limit keeps
+    // the first key, even though it is the one in quarantine.
+    let out_limited = run_warm(root.path(), &cache, &[("VICTORY_WARM_BAD", "0")], &["--used", "--limit", "1"]);
+    assert!(out_limited.contains("0 bad; 1 to make"), "{out_limited}");
+    let done_file = pipelines.join("warm-done.txt");
+    let limited_done = fs::read_to_string(&done_file).unwrap();
+    let expected_entry = format!("{fp_base} {k_fp_bad}");
+    assert!(limited_done.lines().eq([expected_entry.as_str()]), "{limited_done}");
+    assert_eq!(fs::read_to_string(&bad_file).unwrap(), bad_entries);
+    fs::write(&done_file, b"").unwrap();
 
     let out_default = run_warm(root.path(), &cache, &[], &[]);
     assert!(
@@ -113,7 +122,7 @@ fn warm_bad_fingerprint_override_again_and_help() {
         "{out_new_fp}"
     );
 
-    let done = fs::read_to_string(pipelines.join("warm-done.txt")).unwrap();
+    let done = fs::read_to_string(done_file).unwrap();
     let new_fp_keys: Vec<_> = done
         .lines()
         .filter_map(|line| line.split_once(' '))
