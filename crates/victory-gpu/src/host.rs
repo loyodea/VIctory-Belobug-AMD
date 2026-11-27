@@ -9224,15 +9224,13 @@ struct Presenter {
     panel: panel::Panel,
 }
 
-/// The frame rate, shown in the window's caption every second and logged
-/// every few seconds.
-/// Makes the frame meter's lines of every 5 s: on a thread of ours
+/// Makes the frame meter's log lines on a thread of ours
 /// ("victory-meter"), so presenting goes on (`VICTORY_METER_THREAD`, on
 /// unless `=0`: by the presenting thread, as before). Their counters are
 /// taken a moment later than the frames they are divided by; they are only
 /// logged. Never waits: the thread takes them in order.
 fn meter_lines(lines: impl FnOnce() + Send + 'static) {
-    // Read here: whether the meter's lines of every 5 s leave the presenting thread.
+    // Read here: whether the meter's lines leave the presenting thread.
     static ON: OnceLock<bool> = OnceLock::new();
     let on = *ON.get_or_init(|| std::env::var("VICTORY_METER_THREAD").as_deref() != Ok("0"));
     #[cfg(feature = "diagnostics")]
@@ -9265,10 +9263,12 @@ fn meter_lines(lines: impl FnOnce() + Send + 'static) {
     }
 }
 
+/// Counts accepted presents for the window caption and log.
 struct Meter {
     last_present: windows::core::HRESULT,
     since: std::time::Instant,
     frames: u32,
+    log_fps: bool,
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
     drawn: u64,
@@ -9284,6 +9284,7 @@ impl Meter {
             last_present: windows::Win32::Foundation::S_OK,
             since: now,
             frames: 0,
+            log_fps: crate::switch::on("VICTORY_LOG_FPS"),
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
@@ -9298,7 +9299,12 @@ impl Meter {
     }
 
     /// Record a frame once the swap chain has accepted it.
-    fn record_present(&mut self, hwnd: HWND, status: windows::core::HRESULT) -> bool {
+    fn record_present(
+        &mut self,
+        hwnd: HWND,
+        status: windows::core::HRESULT,
+        now: std::time::Instant,
+    ) -> bool {
         use windows::Win32::Foundation::S_OK;
         if status != S_OK && status != self.last_present {
             tracing::warn!(?status, "swap chain did not present the frame");
@@ -9307,12 +9313,12 @@ impl Meter {
         if status != S_OK {
             return false;
         }
-        self.frame(hwnd);
+        self.frame(hwnd, now);
         true
     }
 
     /// Counts a presented frame.
-    fn frame(&mut self, hwnd: HWND) {
+    fn frame(&mut self, hwnd: HWND, now: std::time::Instant) {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
@@ -9322,28 +9328,40 @@ impl Meter {
         {
             self.copy_stats_frames += 1;
         }
-        let elapsed = self.since.elapsed();
+        let elapsed = now.duration_since(self.since);
         if elapsed < std::time::Duration::from_secs(1) {
             return;
         }
         let drawn = crate::draw::drawn();
-        let frames = f64::from(self.frames);
-        let fps = frames / elapsed.as_secs_f64();
-        let ms = elapsed.as_secs_f64() * 1000.0 / frames;
+        let presented_frames = self.frames;
+        let frames = f64::from(presented_frames);
+        let elapsed_s = elapsed.as_secs_f64();
+        let fps = frames / elapsed_s;
+        let ms = elapsed_s * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
-        (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
+        (self.since, self.frames, self.drawn) = (now, 0, drawn);
         // The lines (every second, and more every 5 s: sorting, system
         // calls, some forty lines written) are made by a thread of ours
         // ([`meter_lines`]), not by the presenting thread, the lane: about
         // 3 ms each second there (run ask-1), and 30 ms each 5 s (lane2-0).
         // Their counters are taken there, a moment after the frames counted.
-        let five = self.logged.elapsed() >= std::time::Duration::from_secs(5);
+        let five = now.duration_since(self.logged) >= std::time::Duration::from_secs(5);
         if five {
-            self.logged = std::time::Instant::now();
+            self.logged = now;
         }
         #[cfg(feature = "diagnostics")]
         let copy_stats_frames = if five { std::mem::take(&mut self.copy_stats_frames) as f64 } else { 0.0 };
+        let log_fps = self.log_fps;
         meter_lines(move || {
+            if log_fps {
+                tracing::info!(
+                    target: "victory_gpu::present_fps",
+                    frames = presented_frames,
+                    elapsed_s,
+                    fps,
+                    "frame rate sample"
+                );
+            }
             // Of a frame, ms preparing submissions and ms waiting for the GPU.
             let [cpu, gpu] = [0, 1].map(|i| {
                 SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
@@ -9619,20 +9637,95 @@ impl Meter {
 
 #[cfg(test)]
 mod present_status_tests {
-    use super::{HWND, Meter};
+    use super::{HWND, Meter, meter_lines};
+    use std::process::Command;
+    use std::sync::mpsc;
+    use std::time::Duration;
     use windows::Win32::Foundation::{DXGI_STATUS_OCCLUDED, E_FAIL, S_OK};
 
     #[test]
     fn the_meter_counts_successful_presents_across_a_failure() {
         let mut meter = Meter::new();
         let hwnd = HWND::default();
-        assert!(meter.record_present(hwnd, S_OK));
-        assert!(!meter.record_present(hwnd, DXGI_STATUS_OCCLUDED));
-        assert!(!meter.record_present(hwnd, E_FAIL));
-        assert!(!meter.record_present(hwnd, E_FAIL));
-        assert!(meter.record_present(hwnd, S_OK));
+        let now = meter.since;
+        assert!(meter.record_present(hwnd, S_OK, now));
+        assert!(!meter.record_present(hwnd, DXGI_STATUS_OCCLUDED, now));
+        assert!(!meter.record_present(hwnd, E_FAIL, now));
+        assert!(!meter.record_present(hwnd, E_FAIL, now));
+        assert!(meter.record_present(hwnd, S_OK, now));
         assert_eq!(meter.frames, 2);
         assert_eq!(meter.last_present, S_OK);
+    }
+
+    #[test]
+    fn frame_rate_log_uses_the_caption_windows() {
+        const CHILD: &str = "VICTORY_TEST_FRAME_RATE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            victory_core::logging::init("victory_gpu::host=info,victory_gpu::present_fps=info");
+            let mut meter = Meter::new();
+            let start = meter.since;
+            let hwnd = HWND::default();
+            for (ms, status) in [
+                (0, S_OK),
+                (999, S_OK),
+                (1_000, DXGI_STATUS_OCCLUDED),
+                (1_250, E_FAIL),
+                (1_250, S_OK),
+                (1_500, S_OK),
+                (3_250, E_FAIL),
+                (3_250, S_OK),
+                (5_250, S_OK),
+            ] {
+                assert_eq!(
+                    meter.record_present(hwnd, status, start + Duration::from_millis(ms)),
+                    status == S_OK
+                );
+            }
+            // Wait for the frame meter thread to finish writing its queued lines.
+            let (done, finished) = mpsc::channel();
+            meter_lines(move || done.send(()).unwrap());
+            finished.recv_timeout(Duration::from_secs(15)).unwrap();
+            return;
+        }
+
+        // Run with a fresh logger and environment for each switch value.
+        for enabled in [None, Some("0"), Some("1")] {
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--nocapture",
+                    "--exact",
+                    "host::present_status_tests::frame_rate_log_uses_the_caption_windows",
+                ])
+                .env(CHILD, "1")
+                .env("NO_COLOR", "1")
+                .env_remove("VICTORY_LOG")
+                .env_remove("RUST_LOG")
+                .env_remove("VICTORY_METER_THREAD")
+                .env_remove("VICTORY_AB")
+                .env_remove("VICTORY_LOG_FPS");
+            if let Some(enabled) = enabled {
+                child.env("VICTORY_LOG_FPS", enabled);
+            }
+            let output = child.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let log = String::from_utf8_lossy(&output.stderr);
+            let samples: Vec<_> = log
+                .lines()
+                .filter_map(|line| line.split_once("frame rate sample ").map(|(_, fields)| fields))
+                .collect();
+            let expected = if enabled == Some("1") {
+                &[
+                    "frames=3 elapsed_s=1.25 fps=2.4",
+                    "frames=2 elapsed_s=2.0 fps=1.0",
+                    "frames=1 elapsed_s=2.0 fps=0.5",
+                ][..]
+            } else {
+                &[]
+            };
+            assert_eq!(samples, expected, "{log}");
+            assert_eq!(log.matches(" fps, ").count(), 1, "{log}");
+        }
     }
 }
 
@@ -9924,7 +10017,7 @@ impl Host {
             if status == windows::Win32::Foundation::S_OK {
                 p.panel.frame(p.meter.line_due());
             }
-            let presented = p.meter.record_present(p.hwnd, status);
+            let presented = p.meter.record_present(p.hwnd, status, std::time::Instant::now());
             showing.end();
             if !presented { return None; }
             #[cfg(feature = "diagnostics")]
