@@ -9,6 +9,8 @@ use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
 use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::{Container, FourCC};
+use windows::Win32::Foundation::E_INVALIDARG;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -411,6 +413,22 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+/// Adds a concrete incompatibility to a graphics pipeline refusal.
+fn barycentrics_refusal(
+    error: windows::core::HRESULT,
+    supported: Option<bool>,
+    pixel_dxil: Option<&[u8]>,
+) -> Option<&'static str> {
+    if error != E_INVALIDARG || supported != Some(false) {
+        return None;
+    }
+    let dxil = Container::parse(pixel_dxil?).ok()?;
+    let features: [u8; 8] = dxil.part(FourCC::SFI0)?.data.try_into().ok()?;
+    (u64::from_le_bytes(features) & u64::from(D3D_SHADER_REQUIRES_BARYCENTRICS) != 0).then_some(
+        "pixel shader requires barycentrics, which the host D3D12 device does not support",
+    )
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
@@ -667,6 +685,12 @@ impl HostPipeline {
             false
         };
         let state = g.describe();
+        let pixel_dxil = || {
+            stages
+                .get(1)
+                .and_then(|(shader, _)| shader.translated())
+                .map(|t| t.host.dxil.as_slice())
+        };
         if mesh.is_some() {
             // "triangles": the stream names its topology since it did not
             // load from the library without one (see `mesh_pipeline`); a
@@ -681,7 +705,8 @@ impl HostPipeline {
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
+                    let reason = barycentrics_refusal(e.code(), host.barycentrics, pixel_dxil());
+                    tracing::warn!(error = %e, ?shaders, reason, "host mesh pipeline refused");
                     host.log_messages();
                     return None;
                 }
@@ -708,9 +733,8 @@ impl HostPipeline {
         // fall back on what `draw` does for rectangles.
         let mut rect_gs = None;
         if g.topology.0 == RECTANGLES {
-            let ps = stages.get(1).and_then(|(s, _)| s.translated());
             let vs = &stages[0].0.translated()?.host.dxil;
-            match victory_shader::emit::rect_list_gs(vs, ps.map(|t| &t.host.dxil[..])) {
+            match victory_shader::emit::rect_list_gs(vs, pixel_dxil()) {
                 Ok(gs) => rect_gs = Some(gs),
                 Err(e) => tracing::warn!(error = %e, ?shaders, "no rectangle geometry stage"),
             }
@@ -787,7 +811,8 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                let reason = barycentrics_refusal(e.code(), host.barycentrics, pixel_dxil());
+                tracing::warn!(error = %e, ?shaders, reason, "host pipeline refused");
                 host.log_messages();
                 return None;
             }
@@ -1110,6 +1135,44 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    #[test]
+    fn a_refusal_identifies_barycentrics_only_with_matching_shader_and_capability() {
+        // A synthetic DXBC container with just its feature info part.
+        let mut dxil = Vec::from(*b"DXBC");
+        dxil.extend([0; 16]);
+        for value in [1_u32, 52, 1, 36] {
+            dxil.extend(value.to_le_bytes());
+        }
+        dxil.extend(*b"SFI0");
+        dxil.extend(8_u32.to_le_bytes());
+        let features = dxil.len();
+        dxil.extend(0x2_0000_u64.to_le_bytes());
+
+        assert!(
+            barycentrics_refusal(E_INVALIDARG, Some(false), Some(&dxil))
+                .is_some_and(|reason| reason.contains("pixel shader requires barycentrics"))
+        );
+        assert_eq!(
+            barycentrics_refusal(E_INVALIDARG, Some(true), Some(&dxil)),
+            None
+        );
+        assert_eq!(barycentrics_refusal(E_INVALIDARG, None, Some(&dxil)), None);
+        assert_eq!(
+            barycentrics_refusal(windows::Win32::Foundation::E_FAIL, Some(false), Some(&dxil)),
+            None
+        );
+        assert_eq!(barycentrics_refusal(E_INVALIDARG, Some(false), None), None);
+        assert_eq!(
+            barycentrics_refusal(E_INVALIDARG, Some(false), Some(&dxil[..features])),
+            None
+        );
+        dxil[features..].copy_from_slice(&0x40_0000_u64.to_le_bytes()); // typed 64-bit atomics
+        assert_eq!(
+            barycentrics_refusal(E_INVALIDARG, Some(false), Some(&dxil)),
+            None
+        );
+    }
 
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };

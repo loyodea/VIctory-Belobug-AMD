@@ -38,6 +38,8 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    /// Pixel shader barycentrics support. `None` if the runtime could not report it.
+    pub(crate) barycentrics: Option<bool>,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -1090,7 +1092,16 @@ fn create() -> windows::core::Result<Host> {
                 "host D3D12 adapter"
             );
         }
-        tracing::info!("host D3D12 device ready");
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+        let barycentrics = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS3,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+            .ok()
+            .map(|()| options.BarycentricsSupported.as_bool());
+        tracing::info!(?barycentrics, "host D3D12 device ready");
         // Said once here rather than only as one refusal per pipeline
         // (#168): without these flags nothing the title draws is made.
         if let Some(why) =
@@ -1105,6 +1116,7 @@ fn create() -> windows::core::Result<Host> {
         }
         Ok(Host {
             device,
+            barycentrics,
             queue,
             fence,
             submitted: Mutex::new(0),
